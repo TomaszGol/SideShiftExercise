@@ -1,27 +1,22 @@
-import { strict as assert } from "assert";
-import * as ethers from "ethers";
-import pMap from "p-map";
-import { z } from "zod";
-import axios from "axios";
+import { strict as assert } from 'assert';
+import * as ethers from 'ethers';
+import pMap from 'p-map';
+import { z } from 'zod';
+import axios from 'axios';
 // `ns` is our own wrapper for bignumber.js to deal with mathematic operations for strings
-import { ns } from "@sideshift/shared";
+import { ns } from '@sideshift/shared';
 // `Order` is a TypeORM Entity, i.e a database table
 // `memGetInternalGqlc` returns a GraphQL client memoized by lodash.memoize function
 // `RedisTaskQueue` is a messaging queue that utilizes Redis to store messages
-import {
-  Order,
-  createLogger,
-  memGetInternalGqlc,
-  RedisTaskQueue,
-} from "@sideshift/shared-node";
+import { Order, createLogger, memGetInternalGqlc, RedisTaskQueue } from '@sideshift/shared-node';
 // returns a unique ID to identify deposits
-import { getEthereumNativeDepositUniqueId } from "./shared";
+import { getEthereumNativeDepositUniqueId } from './shared';
 // `context` stores application data, it uses `p-lazy` for efficiency
-import { contextLazy } from "./context";
+import { contextLazy } from './context';
 
 // HACK: Can't find this exported from ethers
 type BlocksWithTransactions = Awaited<
-  ReturnType<ethers.providers.BaseProvider["getBlockWithTransactions"]>
+  ReturnType<ethers.providers.BaseProvider['getBlockWithTransactions']>
 >;
 
 const accountTxListResultSchema = z.array(
@@ -47,7 +42,7 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
 
   const { asset, id: depositMethodId } = nativeMethod;
 
-  const logger = createLogger("ethereum:deposit:confirmed-native");
+  const logger = createLogger('ethereum:deposit:confirmed-native');
   const graphQLClient = memGetInternalGqlc();
 
   async function fetchOrderForAddress(
@@ -55,7 +50,7 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
   ): Promise<Order | undefined> {
     const order = await db
       .getRepository(Order)
-      .createQueryBuilder("o")
+      .createQueryBuilder('o')
       .select()
       .where(`deposit_method = :depositMethodId`, { depositMethodId })
       .andWhere(`deposit_address->>'address' = :address`, { address })
@@ -64,17 +59,25 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
     return order ?? undefined;
   }
 
-  const scanTxid = async (tx: BlocksWithTransactions["transactions"][0]) => {
-    assert.equal(typeof tx, "object", "tx is not object");
-    assert(tx.from, "from missing");
+  const validateTx = (tx: BlocksWithTransactions['transactions'][0])  =>  {
+    assert.equal(typeof tx, 'object', 'tx is not object');
+    assert(tx.from, 'from missing');
 
-    if (typeof tx.hash !== "string") {
+    const { hash: txid, blockHash } = tx;
+
+    if (typeof txid !== 'string') {
       throw new Error(`txid must be string`);
     }
 
-    if (typeof tx.blockHash !== "string") {
+    if (typeof blockHash !== 'string') {
       throw new Error(`blockHash must be string`);
     }
+  };
+
+  const scanTxid = async (tx: BlocksWithTransactions['transactions'][0]): Promise<boolean> => {
+    validateTx(tx)
+
+    const { hash: txid } = tx;
 
     const isGasPriceAndToAddressCorrect =
       tx.to &&
@@ -102,10 +105,10 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
     const wasCredited = await graphQLClient.maybeInternalCreateDeposit({
       orderId: order.id,
       tx: {
-        txid: tx.hash,
+        txid: txid,
       },
       amount: totalAsEther,
-      uniqueId: getEthereumNativeDepositUniqueId(nativeMethod, tx.hash),
+      uniqueId: getEthereumNativeDepositUniqueId(nativeMethod, txid),
     });
 
     if (!wasCredited) {
@@ -113,26 +116,37 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
     }
 
     logger.info(
-      `Stored deposit. ${tx.hash}. ${valueAsEther} ${asset} for order ${order.id}`
+      `Stored deposit. ${txid}. ${valueAsEther} ${asset} for order ${order.id}`
     );
 
     return true;
   };
 
-  const getEtherScanTxListForAddress = async (
+  const getEtherScanTxListForAddressInDesc = async (
     address: string,
-    blockNumber: string
-  ) => {
-    const txList = await axios
-      .get(
-        `https://api.etherscan.io/api?module=account&action=txlist&address=${address}&startblock=${blockNumber}&sort=desc&apikey=${etherscanApiKey}`
-      )
-      .then((res) => accountTxListResultSchema.parse(res));
+    blockNumber: string,
+    orderId: string
+  ): ReturnType<typeof accountTxListResultSchema> => {
+    try{
+      const txList = await axios
+        .get(
+          `https://api.etherscan.io/api?module=account&action=txlist&address=${address}&startblock=${blockNumber}&sort=desc&apikey=${etherscanApiKey}`
+        )
+        .then((res) => accountTxListResultSchema.parse(res));
 
-    return txList;
+      return txList;
+    } catch(error: any) {
+      logger.error(
+        error,
+        'Error fetching txs for order %s: %s',
+        orderId,
+        error.message
+      );
+      return;
+    }
   };
 
-  const getEtherScanBlocknumber = async (timestamp: string) => {
+  const getEtherScanBlocknumber = async (timestamp: string): Promise<string | undefined> => {
     try {
       const blockNumber = await axios.get(
         `https://api.etherscan.io/api?module=block&action=getblocknobytime&timestamp=${timestamp}&closest=before&apikey=${etherscanApiKey}`
@@ -141,7 +155,7 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
     } catch (error: any) {
       logger.error(
         error,
-        "Error fetching block number for order timestamp %s: %s",
+        'Error fetching block number for order timestamp %s: %s',
         timestamp,
         error.message
       );
@@ -150,34 +164,43 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
     }
   };
 
+  const checkIfOrderExistsAndOrderAddressAssigned = (orderId: string, order: Order | undefined): boolean  =>  {
+    if (!order) {
+      logger.error('Order %s not found', orderId);
+
+      return false;
+    }
+
+    if (!order.depositAddress) {
+      logger.error('Order %s has no deposit address', orderId);
+
+      return false;
+    }
+
+    return true;
+  };
+
   const runScanByOrderId = async () => {
     const queue = await RedisTaskQueue.queues.evmNativeConfirm(network, true);
 
     if (!etherscanApiKey) {
-      logger.error("Etherscan not configured");
+      logger.error('Etherscan not configured');
 
       return;
     }
 
-    await queue.run(async (orderId) => {
+    await queue.run(async (orderId: string) => {
       logger.info(
-        "Processing queued task to look at order %s for deposits",
+        'Processing queued task to look at order %s for deposits',
         orderId
       );
 
       const order = await db.getRepository(Order).findOneBy({ id: orderId });
 
-      if (!order) {
-        logger.error("Order %s not found", orderId);
+      const isOrderAndOrderAddressCorrect = checkIfOrderExistsAndOrderAddressAssigned(orderId, order)
 
-        return;
-      }
-
-      if (!order.depositAddress) {
-        // The deposit address may have been unassigned
-        logger.error("Order %s has no deposit address", orderId);
-
-        return;
+      if (!isOrderAndOrderAddressCorrect) {
+        return true;
       }
 
       const blockNumber = await getEtherScanBlocknumber(
@@ -188,22 +211,13 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
         return;
       }
 
-      let txs;
+      const txs = await getEtherScanTxListForAddressInDesc(
+        order.depositAddress.address,
+        blockNumber,
+        orderId
+      );
 
-      try {
-        // In descending order
-        txs = await getEtherScanTxListForAddress(
-          order.depositAddress.address,
-          blockNumber
-        );
-      } catch (error: any) {
-        logger.error(
-          error,
-          "Error fetching txs for order %s: %s",
-          orderId,
-          error.message
-        );
-
+      if (!txs) {
         return;
       }
 
@@ -213,18 +227,18 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
         .filter((tx) => ethers.BigNumber.from(tx.value).gt(0))
         .slice(0, 10);
 
-      logger.info("Found %s transactions for order %s", txs.length, orderId);
+      logger.info('Found %s transactions for order %s', txs.length, orderId);
 
-      await pMap(trimmedTxs, async (etherscanTx) => {
+      await pMap(trimmedTxs, async (etherscanTx): Promise<undefined> => {
         const ethersTx = await nodeProvider.getTransaction(etherscanTx.hash);
 
         if (!ethersTx) {
-          logger.error("Transaction %s not found", etherscanTx.hash);
+          logger.error('Transaction %s not found', etherscanTx.hash);
 
           return;
         }
 
-        logger.info("Scanning tx %s", etherscanTx.hash);
+        logger.info('Scanning tx %s', etherscanTx.hash);
 
         await scanTxid(ethersTx);
       });
